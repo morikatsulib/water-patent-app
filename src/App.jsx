@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, CartesianGrid } from "recharts";
-import { Search, Filter, X, ChevronRight, Globe, FileText, BarChart3, Map, ArrowRight, Database, Calendar, Building2, Tag, TrendingUp, CheckCircle2, Clock, AlertCircle, XCircle, MinusCircle, Eye, Plus, Trash2, Edit3, Copy, FolderOpen, Settings, GripVertical, Undo2, Redo2, ZoomIn, ZoomOut, Maximize2, LayoutGrid, Save, PlusCircle } from "lucide-react";
+import { Search, Filter, X, ChevronRight, Globe, FileText, BarChart3, Map, ArrowRight, Database, Calendar, Building2, Tag, TrendingUp, CheckCircle2, Clock, AlertCircle, XCircle, MinusCircle, Eye, Plus, Trash2, Edit3, Copy, FolderOpen, Settings, GripVertical, Undo2, Redo2, ZoomIn, ZoomOut, Maximize2, LayoutGrid, Save, PlusCircle, Upload, Download, Info } from "lucide-react";
 
 // ═══════════════════════════════════════════════
 // CONSTANTS & CONFIG
@@ -684,6 +684,359 @@ function PatentDeleteConfirm({ patent, onConfirm, onClose }) {
 }
 
 // ═══════════════════════════════════════════════
+// CSV IMPORT
+// ═══════════════════════════════════════════════
+
+// Parse CSV text handling quoted fields, newlines in quotes, etc.
+function parseCSV(text) {
+  const rows = [];
+  let current = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += ch;
+      }
+    } else {
+      if (ch === '"') { inQuotes = true; }
+      else if (ch === ',') { current.push(field.trim()); field = ""; }
+      else if (ch === '\n' || (ch === '\r' && text[i + 1] === '\n')) {
+        current.push(field.trim()); field = "";
+        if (current.some(c => c !== "")) rows.push(current);
+        current = [];
+        if (ch === '\r') i++;
+      } else {
+        field += ch;
+      }
+    }
+  }
+  current.push(field.trim());
+  if (current.some(c => c !== "")) rows.push(current);
+  return rows;
+}
+
+const CSV_COLUMN_MAP = {
+  "出願番号": "appNum", "appnum": "appNum", "application_number": "appNum", "application number": "appNum", "出願番号/登録番号": "appNum",
+  "タイトル": "title", "title": "title", "発明の名称": "title", "名称": "title",
+  "出願人": "applicant", "applicant": "applicant", "出願人/権利者": "applicant", "権利者": "applicant",
+  "出願日": "filingDate", "filing_date": "filingDate", "filing date": "filingDate", "filingdate": "filingDate",
+  "ステータス": "status", "status": "status", "法的状態": "status", "法的状況": "status",
+  "出願国": "country", "country": "country", "国コード": "country", "国": "country",
+  "ipc": "ipc", "ipc分類": "ipc", "ipc classification": "ipc", "国際特許分類": "ipc",
+  "要約": "abstract", "abstract": "abstract", "概要": "abstract",
+  "工程": "blockTypes", "blocktypes": "blockTypes", "block_types": "blockTypes", "関連工程": "blockTypes", "工程ブロック": "blockTypes",
+  "ファミリー数": "familyCount", "familycount": "familyCount", "family_count": "familyCount", "family count": "familyCount", "パテントファミリー": "familyCount",
+  "登録日": "grantDate", "grant_date": "grantDate", "grant date": "grantDate", "grantdate": "grantDate",
+  "満了日": "expiryDate", "expiry_date": "expiryDate", "expiry date": "expiryDate", "expirydate": "expiryDate", "期限日": "expiryDate",
+};
+
+const STATUS_LABEL_MAP = {
+  "出願済": "FILED", "filed": "FILED",
+  "公開済": "PUBLISHED", "published": "PUBLISHED",
+  "審査中": "EXAMINING", "examining": "EXAMINING",
+  "登録済": "GRANTED", "granted": "GRANTED",
+  "失効": "EXPIRED", "expired": "EXPIRED",
+  "拒絶": "REJECTED", "rejected": "REJECTED",
+  "取下げ": "WITHDRAWN", "withdrawn": "WITHDRAWN",
+};
+
+function normalizePatentRow(row, columnMapping) {
+  const patent = { id: uid(), blockTypes: [], familyCount: 1 };
+  for (const [csvIdx, field] of Object.entries(columnMapping)) {
+    const val = row[csvIdx];
+    if (val === undefined || val === "") continue;
+    switch (field) {
+      case "status": {
+        const upper = val.toUpperCase();
+        patent.status = STATUS_CONFIG[upper] ? upper : (STATUS_LABEL_MAP[val] || STATUS_LABEL_MAP[val.toLowerCase()] || "FILED");
+        break;
+      }
+      case "country": {
+        const upper = val.toUpperCase();
+        patent.country = COUNTRIES[upper] ? upper : "JP";
+        break;
+      }
+      case "blockTypes": {
+        const types = val.split(/[;|、,]/).map(s => s.trim().toLowerCase()).filter(Boolean);
+        const validTypes = BLOCK_TYPES.map(b => b.type);
+        patent.blockTypes = types.filter(t => validTypes.includes(t));
+        if (patent.blockTypes.length === 0) patent.blockTypes = types.length > 0 ? types : [];
+        break;
+      }
+      case "familyCount":
+        patent.familyCount = parseInt(val, 10) || 1;
+        break;
+      default:
+        patent[field] = val;
+    }
+  }
+  return patent;
+}
+
+function validatePatent(p) {
+  const errors = [];
+  if (!p.appNum) errors.push("出願番号が必要です");
+  if (!p.title) errors.push("タイトルが必要です");
+  if (!p.applicant) errors.push("出願人が必要です");
+  if (!p.filingDate) errors.push("出願日が必要です");
+  return errors;
+}
+
+function CSVImportModal({ onImport, onClose }) {
+  const [step, setStep] = useState("upload"); // upload | mapping | preview
+  const [rawRows, setRawRows] = useState([]);
+  const [headers, setHeaders] = useState([]);
+  const [columnMapping, setColumnMapping] = useState({});
+  const [parsedPatents, setParsedPatents] = useState([]);
+  const [validationErrors, setValidationErrors] = useState([]);
+  const [importMode, setImportMode] = useState("append"); // append | replace
+  const fileInputRef = useRef(null);
+
+  const handleFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const text = ev.target.result;
+      const rows = parseCSV(text);
+      if (rows.length < 2) return;
+      const hdrs = rows[0];
+      setHeaders(hdrs);
+      setRawRows(rows.slice(1));
+
+      // Auto-map columns
+      const mapping = {};
+      hdrs.forEach((h, idx) => {
+        const key = h.toLowerCase().trim();
+        if (CSV_COLUMN_MAP[key]) mapping[idx] = CSV_COLUMN_MAP[key];
+      });
+      setColumnMapping(mapping);
+      setStep("mapping");
+    };
+    reader.readAsText(file, "UTF-8");
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const file = e.dataTransfer?.files?.[0];
+    if (file && (file.name.endsWith('.csv') || file.type === 'text/csv')) {
+      const fakeEvent = { target: { files: [file] } };
+      handleFile(fakeEvent);
+    }
+  };
+
+  const proceedToPreview = () => {
+    const patents = rawRows.map(row => normalizePatentRow(row, columnMapping));
+    const errs = patents.map((p, i) => ({ row: i + 2, errors: validatePatent(p) })).filter(e => e.errors.length > 0);
+    setParsedPatents(patents);
+    setValidationErrors(errs);
+    setStep("preview");
+  };
+
+  const doImport = () => {
+    const valid = parsedPatents.filter((_, i) => !validationErrors.find(e => e.row === i + 2));
+    onImport(valid, importMode);
+    onClose();
+  };
+
+  const downloadTemplate = () => {
+    const bom = "\uFEFF";
+    const header = "出願番号,タイトル,出願人,出願日,ステータス,出願国,IPC分類,要約,工程,ファミリー数,登録日,満了日";
+    const example = "JP2024-000001,水処理装置の改良,サンプル株式会社,2024-01-15,出願済,JP,C02F 1/52,水処理装置の効率を向上させる改良技術,filtration,1,,";
+    const csv = bom + header + "\n" + example + "\n";
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "特許インポートテンプレート.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const validCount = parsedPatents.length - validationErrors.length;
+
+  const PATENT_FIELDS = [
+    { key: "appNum", label: "出願番号" }, { key: "title", label: "タイトル" }, { key: "applicant", label: "出願人" },
+    { key: "filingDate", label: "出願日" }, { key: "status", label: "ステータス" }, { key: "country", label: "出願国" },
+    { key: "ipc", label: "IPC分類" }, { key: "abstract", label: "要約" }, { key: "blockTypes", label: "工程ブロック" },
+    { key: "familyCount", label: "ファミリー数" }, { key: "grantDate", label: "登録日" }, { key: "expiryDate", label: "満了日" },
+  ];
+
+  return (
+    <DialogOverlay onClose={onClose} size="xl">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-base font-bold text-gray-900 flex items-center gap-2">
+          <Upload size={16} className="text-blue-500" /> CSVインポート
+        </h3>
+        <button onClick={onClose} className="p-1 hover:bg-gray-100 rounded-lg"><X size={18} /></button>
+      </div>
+
+      {/* Step indicators */}
+      <div className="flex items-center gap-2 mb-5">
+        {[["upload", "1. ファイル選択"], ["mapping", "2. カラム設定"], ["preview", "3. プレビュー"]].map(([key, label]) => (
+          <div key={key} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium ${
+            step === key ? "bg-blue-100 text-blue-700" : "text-gray-400"}`}>
+            {label}
+          </div>
+        ))}
+      </div>
+
+      {/* Step 1: Upload */}
+      {step === "upload" && (
+        <div>
+          <div
+            className="border-2 border-dashed border-gray-300 rounded-xl p-10 text-center hover:border-blue-400 transition cursor-pointer"
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={e => { e.preventDefault(); e.stopPropagation(); }}
+            onDrop={handleDrop}
+          >
+            <Upload size={36} className="mx-auto mb-3 text-gray-400" />
+            <p className="text-sm text-gray-600 mb-1">CSVファイルをドラッグ＆ドロップ</p>
+            <p className="text-xs text-gray-400">またはクリックしてファイルを選択</p>
+            <input ref={fileInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleFile} />
+          </div>
+          <div className="mt-4 p-3 bg-blue-50 rounded-lg">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-medium text-blue-700 flex items-center gap-1 mb-1"><Info size={12} /> CSVフォーマット</p>
+                <p className="text-xs text-blue-600">
+                  1行目をヘッダー行としてカラム名を自動認識します。対応カラム名: 出願番号, タイトル, 出願人, 出願日, ステータス, 出願国, IPC分類, 要約, 工程, ファミリー数, 登録日, 満了日
+                </p>
+              </div>
+              <button onClick={downloadTemplate}
+                className="flex-shrink-0 px-3 py-1.5 text-xs font-medium text-blue-700 bg-white border border-blue-300 rounded-lg hover:bg-blue-100 transition flex items-center gap-1">
+                <Download size={12} /> テンプレート
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Step 2: Column Mapping */}
+      {step === "mapping" && (
+        <div>
+          <p className="text-xs text-gray-500 mb-3">CSVのカラムと特許データのフィールドを対応付けてください。{headers.length}カラム, {rawRows.length}行を検出しました。</p>
+          <div className="max-h-[360px] overflow-y-auto space-y-2">
+            {headers.map((h, idx) => (
+              <div key={idx} className="flex items-center gap-3 p-2 bg-gray-50 rounded-lg">
+                <span className="text-xs font-medium text-gray-700 w-40 truncate" title={h}>{h}</span>
+                <ArrowRight size={14} className="text-gray-400 flex-shrink-0" />
+                <select
+                  className="flex-1 text-xs border border-gray-200 rounded-lg px-2 py-1.5 bg-white focus:ring-2 focus:ring-blue-200"
+                  value={columnMapping[idx] || ""}
+                  onChange={e => {
+                    const v = e.target.value;
+                    setColumnMapping(prev => {
+                      const next = { ...prev };
+                      if (v) next[idx] = v; else delete next[idx];
+                      return next;
+                    });
+                  }}
+                >
+                  <option value="">-- スキップ --</option>
+                  {PATENT_FIELDS.map(f => (
+                    <option key={f.key} value={f.key} disabled={Object.values(columnMapping).includes(f.key) && columnMapping[idx] !== f.key}>
+                      {f.label}
+                    </option>
+                  ))}
+                </select>
+                {columnMapping[idx] && <span className="text-xs text-green-600">&#10003;</span>}
+              </div>
+            ))}
+          </div>
+          <div className="flex justify-between mt-4">
+            <button onClick={() => setStep("upload")} className="px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-100 rounded-lg">戻る</button>
+            <button onClick={proceedToPreview}
+              className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+              disabled={Object.keys(columnMapping).length === 0}>
+              プレビュー
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Step 3: Preview */}
+      {step === "preview" && (
+        <div>
+          <div className="flex items-center gap-3 mb-3">
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-gray-500">インポート件数:</span>
+              <span className="font-bold text-blue-700">{validCount}</span>
+              <span className="text-gray-400">/ {parsedPatents.length} 件</span>
+            </div>
+            {validationErrors.length > 0 && (
+              <span className="text-xs text-amber-600 flex items-center gap-1">
+                <AlertCircle size={12} /> {validationErrors.length}件にエラーあり（スキップされます）
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-3 mb-3 p-2 bg-gray-50 rounded-lg">
+            <span className="text-xs text-gray-500">インポート方法:</span>
+            <label className="flex items-center gap-1 text-xs cursor-pointer">
+              <input type="radio" name="importMode" value="append" checked={importMode === "append"} onChange={() => setImportMode("append")} className="accent-blue-600" />
+              追加（既存データに追加）
+            </label>
+            <label className="flex items-center gap-1 text-xs cursor-pointer">
+              <input type="radio" name="importMode" value="replace" checked={importMode === "replace"} onChange={() => setImportMode("replace")} className="accent-blue-600" />
+              置換（既存データを置換）
+            </label>
+          </div>
+
+          <div className="max-h-[280px] overflow-auto border border-gray-200 rounded-lg">
+            <table className="w-full text-xs">
+              <thead className="bg-gray-50 sticky top-0">
+                <tr>
+                  <th className="px-2 py-1.5 text-left text-gray-500 font-medium">行</th>
+                  <th className="px-2 py-1.5 text-left text-gray-500 font-medium">出願番号</th>
+                  <th className="px-2 py-1.5 text-left text-gray-500 font-medium">タイトル</th>
+                  <th className="px-2 py-1.5 text-left text-gray-500 font-medium">出願人</th>
+                  <th className="px-2 py-1.5 text-left text-gray-500 font-medium">出願国</th>
+                  <th className="px-2 py-1.5 text-left text-gray-500 font-medium">状態</th>
+                </tr>
+              </thead>
+              <tbody>
+                {parsedPatents.map((p, i) => {
+                  const err = validationErrors.find(e => e.row === i + 2);
+                  return (
+                    <tr key={i} className={`border-t border-gray-100 ${err ? "bg-red-50" : "hover:bg-gray-50"}`}>
+                      <td className="px-2 py-1.5 text-gray-400">{i + 2}</td>
+                      <td className="px-2 py-1.5">{p.appNum || <span className="text-red-400">未設定</span>}</td>
+                      <td className="px-2 py-1.5 max-w-[200px] truncate">{p.title || <span className="text-red-400">未設定</span>}</td>
+                      <td className="px-2 py-1.5">{p.applicant || <span className="text-red-400">未設定</span>}</td>
+                      <td className="px-2 py-1.5">{p.country && COUNTRIES[p.country] ? `${COUNTRIES[p.country].flag} ${p.country}` : "-"}</td>
+                      <td className="px-2 py-1.5">
+                        {err ? <span className="text-red-500" title={err.errors.join(", ")}>&#9888; エラー</span>
+                          : p.status && STATUS_CONFIG[p.status] ? <StatusBadge status={p.status} /> : "-"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="flex justify-between mt-4">
+            <button onClick={() => setStep("mapping")} className="px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-100 rounded-lg">戻る</button>
+            <button onClick={doImport}
+              className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-1.5 disabled:opacity-50"
+              disabled={validCount === 0}>
+              <Download size={14} /> {validCount}件をインポート
+            </button>
+          </div>
+        </div>
+      )}
+    </DialogOverlay>
+  );
+}
+
+// ═══════════════════════════════════════════════
 // STATS PANEL
 // ═══════════════════════════════════════════════
 function StatsPanel({ patents }) {
@@ -809,6 +1162,16 @@ function ProjectDashboard({ project, onUpdateProject, onBack }) {
     if (selectedPatent?.id === id) setSelectedPatent(null);
   };
 
+  // ── CSV Import ──
+  const [showCsvImport, setShowCsvImport] = useState(false);
+  const handleCsvImport = (patents, mode) => {
+    if (mode === "replace") {
+      onUpdateProject({ ...project, patents });
+    } else {
+      onUpdateProject({ ...project, patents: [...project.patents, ...patents] });
+    }
+  };
+
   const saveName = () => {
     onUpdateProject({ ...project, name: projectName });
     setEditingName(false);
@@ -838,6 +1201,10 @@ function ProjectDashboard({ project, onUpdateProject, onBack }) {
             )}
           </div>
           <div className="flex items-center gap-2">
+            <button onClick={() => setShowCsvImport(true)}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 transition flex items-center gap-1">
+              <Upload size={13} /> CSVインポート
+            </button>
             <button onClick={openCreatePatent}
               className="px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 text-white hover:bg-blue-700 transition flex items-center gap-1">
               <PlusCircle size={13} /> 特許追加
@@ -978,6 +1345,14 @@ function ProjectDashboard({ project, onUpdateProject, onBack }) {
           onClose={() => setDeletingPatent(null)}
         />
       )}
+
+      {/* CSV Import Modal */}
+      {showCsvImport && (
+        <CSVImportModal
+          onImport={handleCsvImport}
+          onClose={() => setShowCsvImport(false)}
+        />
+      )}
     </div>
   );
 }
@@ -986,7 +1361,7 @@ function ProjectDashboard({ project, onUpdateProject, onBack }) {
 // MAIN APP - Project Management
 // ═══════════════════════════════════════════════
 function DialogOverlay({ children, onClose, size = "sm" }) {
-  const maxW = size === "lg" ? "max-w-2xl" : size === "md" ? "max-w-lg" : "max-w-sm";
+  const maxW = size === "xl" ? "max-w-4xl" : size === "lg" ? "max-w-2xl" : size === "md" ? "max-w-lg" : "max-w-sm";
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-[100]" onClick={onClose}>
       <div className={`bg-white rounded-xl shadow-2xl p-6 mx-4 w-full ${maxW} max-h-[85vh] overflow-y-auto`} onClick={e => e.stopPropagation()}>
